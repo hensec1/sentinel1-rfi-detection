@@ -3,10 +3,16 @@
 
 # Output data
 output/downloads/
+output/iran_downloads/
+output/gulf_downloads/
+output/nisar_downloads/
+output/dem_cache/
 output/*.html
 output/*.json
 output/*.png
 output/jamertest/
+output/iran_rfi/
+output/gulf_rfi/
 
 # Python
 __pycache__/

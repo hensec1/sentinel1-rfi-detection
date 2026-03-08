@@ -1,163 +1,118 @@
 # Sentinel-1 RFI Detection: Mapping GPS/GNSS Jamming from Space
 
-Detect and map radio frequency interference (RFI) in Sentinel-1 SAR imagery, a technique that can reveal GPS/GNSS jamming activity visible from orbit.
+Detect and map radio frequency interference (RFI) in Sentinel-1 SAR imagery using temporal baseline z-scores and DEM terrain masking. This pipeline can reveal GPS/GNSS jamming activity visible from orbit while filtering out false positives from mountainous terrain and orbit geometry effects.
 
-This pipeline searches the Copernicus Data Space Ecosystem (CDSE) for Sentinel-1 GRD products, downloads them, runs multi-method RFI detection, and produces georeferenced interactive maps showing interference zones overlaid on satellite imagery.
+## What's New: Temporal Z-Score Detection (v2)
 
-## Background: Why SAR Can Detect GPS Jamming
+The original pipeline used single-scene statistical thresholds that were sensitive to terrain, incidence angle, and orbit geometry — producing inflated scores, particularly in mountainous areas. The v2 pipeline addresses this with a two-pass temporal approach:
 
-### Sentinel-1 and C-band SAR
+**Pass 1** builds a per-location baseline by accumulating radar backscatter across all scenes onto a geographic grid. Each scene is normalized by its own median dB to remove orbit-dependent incidence angle effects. Copernicus 30m DEM data masks steep terrain (slope >15°) to eliminate layover/foreshortening artifacts.
 
-The Sentinel-1 constellation (S1A and S1C) carries a C-band synthetic aperture radar operating at 5.405 GHz. Unlike optical satellites, SAR is an active sensor, it transmits microwave pulses and records the echoes. This makes it sensitive to any ground-based RF emitter operating near its frequency band.
-
-When a SAR satellite passes over an active RF emitter on the ground, the emitter's signal is received by the radar antenna alongside the legitimate radar echoes. The SAR processor cannot distinguish these signals from real backscatter, so the interference appears as anomalous bright streaks, bands, or hotspots in the imagery that don't correspond to any physical features on the ground.
-
-### The GPS/GNSS Connection
-
-GPS/GNSS jammers operate at L-band frequencies (1.164–1.610 GHz) roughly 4 GHz below Sentinel-1's C-band. Despite this frequency gap, there are several mechanisms by which GPS jamming infrastructure produces detectable interference in SAR imagery:
-
-**1. Harmonic radiation.** GPS jammers built around oscillators near 1.35 GHz produce harmonics at integer multiples. The 4th harmonic of 1.35 GHz falls at 5.4 GHz, directly in Sentinel-1's receive band. Even with power falling off at each harmonic, military-grade jammers can produce enough 4th-harmonic energy to saturate a SAR receiver at moderate range.
-
-**2. Co-located electronic warfare infrastructure.** GPS jamming is rarely deployed in isolation. Military and state-level jamming installations typically include broader EW systems that may operate at or near C-band frequencies. The GPS jammer itself serves as a marker for a facility whose other emitters interfere with SAR.
-
-**3. Broadband noise leakage.** High-power jammers, particularly wideband noise generators, don't confine their output precisely to the target frequency band. Spectral sidelobes, intermodulation products, and out-of-band emissions can extend well above the intended jamming band, especially from poorly filtered or deliberately broadband systems.
-
-### Honest Caveats
-
-The ~4 GHz frequency gap between GPS L-band and Sentinel-1 C-band means not all GPS jammers will be visible in SAR. Low-power personal privacy devices and well-filtered military systems may produce no detectable C-band interference. The correlation between SAR RFI hotspots and GPS jamming is strongest for:
-
-- High-power fixed-site jammers (state-level military installations)
-- Wideband noise jammers with poor spectral containment
-- Dense jamming deployments where multiple systems create cumulative emissions
-
-Conversely, SAR can detect C-band RFI that has nothing to do with GPS, radar altimeters, C-band communications, and other emitters. Context (location, geopolitics, temporal patterns) is essential for attributing SAR RFI detections to GPS jamming specifically.
-
-### Why VH Cross-Polarization Is More Sensitive
-
-Sentinel-1 GRD products include two polarization channels: VV (co-polarized) and VH (cross-polarized). Natural terrain backscatter is much stronger in VV than VH — typically 6–10 dB higher. Ground-based RF emitters, however, radiate with arbitrary polarization that is received roughly equally in both channels.
-
-This means the signal-to-clutter ratio for RFI is much higher in VH: the interference signal is comparable in both channels, but the natural background is much lower in VH. In practice, we consistently observe higher RFI detection scores in VH than VV for the same product, making VH the preferred channel for jamming detection.
-
-## Detection Methodology
-
-The pipeline applies four independent detection methods and combines their outputs into a composite severity score.
-
-### 1. Azimuth-Line Analysis
-
-For each azimuth line (row) in the SAR image, compute the mean backscatter in dB. RFI from ground-based emitters elevates entire range lines, producing anomalously bright rows.
-
-- Compute row-wise mean of the dB image
-- Estimate robust baseline using median and MAD (median absolute deviation)
-- Flag lines where the row mean exceeds 3-sigma above the median
-- Report percentage of flagged lines
-
-### 2. Bright Pixel Detection
-
-Detect individual pixels that are anomalously bright relative to their local neighborhood, indicating localized RFI hotspots.
-
-- Compute a local baseline using median filtering (applied on a downsampled grid for efficiency)
-- Subtract baseline to get residuals
-- Flag pixels exceeding 4-sigma above the residual median (using MAD-based robust sigma)
-- Report count and percentage of bright pixels
-
-### 3. Spectral Peak Analysis
-
-Analyze the frequency content along azimuth columns to find narrow-band interference signatures.
-
-- Sample 64 evenly-spaced range columns
-- For each column, apply a Hann window and compute the FFT
-- Estimate the spectral noise floor via the median
-- Flag spectral bins exceeding the floor by 5-sigma
-- Report total anomalous spectral peaks across all sampled columns
-
-### 4. Streak Detection
-
-Identify connected bright-pixel structures that form horizontal (range-direction) streaks, the classic visual signature of SAR RFI.
-
-- Label connected components in the bright-pixel mask (downsampled for performance)
-- Retain components wider than 50 pixels with aspect ratio > 5:1 (width:height)
-- Report count of detected linear streaks
-
-### Composite Score
-
-The four methods are combined into a single severity score (0–100):
-
-```
-score = min(100, pct_rfi_lines * 2 + pct_bright * 10 + min(peaks, 100) * 0.3 + n_streaks * 5)
-```
-
-| Score | Severity | Interpretation |
-|-------|----------|----------------|
-| > 60 | **HIGH** | Strong, persistent RFI — consistent with active jamming |
-| 30–60 | **MODERATE** | Significant interference detected |
-| 10–30 | **LOW** | Minor interference present |
-| 0–10 | **MINIMAL/NONE** | No significant RFI |
-
-## Georeferencing and Map Generation
-
-The interactive map (`create_map.py`) takes raw SAR pixels and places them accurately on a geographic coordinate system:
-
-1. **GCP Extraction**: Parse the 210-point geolocation grid from Sentinel-1 annotation XML files. These ground control points map (line, pixel) coordinates to (latitude, longitude).
-
-2. **Forward/Inverse Interpolation**: Build cubic spline interpolators (`RectBivariateSpline`) for the forward mapping and `griddata` for the inverse mapping (geographic coordinates back to sensor coordinates).
-
-3. **Warping**: Resample SAR imagery and RFI masks from sensor geometry to a regular lat/lon grid using `scipy.ndimage.map_coordinates`.
-
-4. **Vectorization**: Convert warped binary RFI masks to GeoJSON polygons using `rasterio.features.shapes` and simplify with Shapely.
-
-5. **HTML Assembly**: Produce a single self-contained HTML file with:
-   - Leaflet.js map with CARTO Voyager and Esri satellite basemaps
-   - SAR image overlays as base64-encoded PNGs with configurable opacity
-   - RFI polygons styled by severity (red = HIGH, orange = MODERATE, gold = LOW)
-   - Layer toggle and click popups with detection metadata
+**Pass 2** scores each scene against the baseline. For every pixel, the z-score measures how many standard deviations the observation is from the temporal mean at that location. Only pixels with z > 3.0 are flagged as RFI candidates. Stable terrain, urban backscatter, and orbit geometry effects are all absorbed into the baseline.
 
 ## Results
 
-### Tehran, Iran (Feb–Mar 2026)
+### Iran & Persian Gulf (Feb–Mar 2026)
 
-Persistent MODERATE-level RFI detected across multiple Sentinel-1A passes over Tehran. The VH channel consistently shows stronger signatures than VV, consistent with ground-based emitters.
+Temporal z-score analysis across 102 scenes (Iran) and 103 scenes (Persian Gulf), Feb 28 – Mar 7, 2026.
 
-| Date | Pass | Pol | Score | Severity |
-|------|------|-----|-------|----------|
-| 2026-02-19 | Ascending | VH | 51.8 | MODERATE |
-| 2026-02-19 | Ascending | VV | 38.2 | MODERATE |
+| Region | Scenes | Baseline Cells | Avg Obs/Cell | Temporal RFI Points | Persistent Hotspots (z>3) |
+|--------|--------|---------------|-------------|--------------------|-----------------------|
+| Iran | 102 | 1,686,368 | 335.5 | 482,688 | 501,581 |
+| Persian Gulf | 103 | 1,555,217 | 372.8 | 449,435 | 379,690 |
 
-Tehran passes show RFI in every acquisition analyzed, with VH scores 10–15 points higher than VV — the expected pattern for ground-based emitters against the lower cross-pol background.
+The temporal model produces much lower per-scene scores (0–4/100 vs 30–97 in the original) by eliminating terrain-correlated false positives. The remaining detections represent genuine temporal anomalies — pixels that are anomalously bright relative to their own multi-pass baseline.
 
-### Jamertest Norway (Sep 2025)
+### Jammertest Norway (Sep 2025) — Updated Analysis
 
-Norway's [Jamertest](https://www.jamertest.no/) is an annual GPS/GNSS jamming exercise in Bleik, northern Norway, conducted September 10–18, 2025 with published hours of 09:00–23:30 local time.
+Norway's NPRA runs an annual controlled GNSS jamming exercise called [Jammertest](https://www.jamertest.no/) at three sites on northern Andøya: Bleik, Ramnan (50W "Porcus Maior" PRN jammer), and Stave. The 2025 test ran September 15–19 with full transmission schedules published on [GitHub](https://github.com/NPRA/jammertest-plan).
 
-| Date | Sat | Time (local) | Context | VH Score | VV Score |
-|------|-----|-------------|---------|----------|----------|
-| 2025-09-10 | S1A | 18:15 | Pre-event baseline | 30.2 | 30.1 |
-| 2025-09-11 | S1C | 18:07 | Day 1, DURING jamming | **100.0** | 40.2 |
-| 2025-09-16 | S1A | 07:45 | Mid-event, OUTSIDE hours | 78.4 | 34.0 |
-| 2025-09-16 | S1C | 18:15 | Mid-event, DURING jamming | **100.0** | 9.3 |
-| 2025-09-18 | S1A | 07:28 | Late event, OUTSIDE hours | 35.8 | 46.6 |
-| 2025-09-20 | S1A | 18:32 | Post-event baseline | 37.9 | 30.5 |
+#### Original vs Temporal Z-Score Scores
 
-Key observations:
+| Date | Sat | Local Time | Old VH Score | New Score | Context |
+|------|-----|-----------|-------------|-----------|---------|
+| Sep 10 | S1A | 18:15 | 30 | 0.0 | Pre-event baseline |
+| Sep 11 | S1C | 18:07 | 100 | 1.1 | 4 days before test week |
+| Sep 16 | S1A | 07:45 | 78 | 0.6 | Test week, before daily sessions |
+| Sep 16 | S1C | 18:15 | 100 | 0.6 | Test week, between sessions |
+| Sep 18 | S1A | 07:29 | 36 | 0.0 | Test week, before daily sessions |
+| Sep 20 | S1A | 18:32 | 38 | 0.0 | Post-event baseline |
 
-- **During active jamming hours**: VH scores max out at 100, with 24–46% of azimuth lines flagged and 2.5–3.8% bright pixels. This is unambiguous, intense RFI.
-- **Outside jamming hours**: Scores drop to the 30–40 range. The residual signal likely reflects other regional RF sources or residual equipment emissions.
-- **Pre/post event baselines** (~30) establish the ambient interference floor for the region.
-- **VH vs VV divergence** is most dramatic during active jamming — Sep 16 DURING shows VH=100 vs VV=9.3, a 90-point gap. This is the clearest signature of an artificial emitter against natural terrain backscatter.
+The old VH=100 scores were terrain artifacts. With DEM masking and temporal normalization, those false positives disappear. However, the spatial analysis reveals something the original method couldn't isolate:
 
-### Comparison Summary
+#### Spatial Concentration Near Jammer Sites
 
-| Region | Period | VH Range | VV Range | Interpretation |
-|--------|--------|----------|----------|----------------|
-| Jamertest (during) | Sep 2025 | 78–100 | 9–40 | Confirmed active GPS jamming |
-| Tehran | Feb 2026 | ~52 | ~38 | Persistent moderate interference |
-| Jamertest (baseline) | Sep 2025 | 30–38 | 30–31 | Ambient regional RF environment |
+| Date | Context | % RFI <10km | % RFI <20km | Min Dist | Ramnan <10km |
+|------|---------|------------|------------|----------|-------------|
+| Sep 10 | Baseline | 0.1% | 0.2% | 3.3 km | 0.1% |
+| Sep 16 DESC | Test week PM | **3.4%** | **7.6%** | **0.3 km** | **3.1%** |
+| Sep 16 ASC | Test week AM | **3.8%** | **8.0%** | **0.4 km** | **3.4%** |
+| Sep 20 | Baseline | 0.4% | 1.3% | 2.0 km | 0.4% |
+
+Sep 16 shows **10–14x more RFI within 20km of the jammer cluster** than baselines, consistent across two independent orbits. The concentration is tightest around Ramnan, the 50W Porcus Maior site, with detections 300m from the transmitter location.
+
+#### Timing Analysis
+
+Cross-referencing the NPRA daily schedule against S1 overpass times:
+
+- **Sep 16 evening (18:15 local):** The 50W Porcus Maior session was scheduled for 19:00 — only 45 minutes after the S1 overpass. At 18:15, only a 0W closedown procedure was active.
+- **Sep 16 morning (07:45 local):** First scheduled transmission at 09:00 — 1h15m after the overpass.
+- **No S1 overpass coincided with a scheduled transmission.**
+
+The most parsimonious explanation for the spatial anomaly is equipment warm-up: the 50W amplifier chain at Ramnan being powered up before its scheduled test window, producing out-of-band spurious emissions. This is consistent with Sep 18 (same time window, only milliwatt equipment scheduled) showing no spatial anomaly.
+
+See [docs/jammertest_analysis.md](docs/jammertest_analysis.md) for the full analysis.
+
+## Detection Pipeline
+
+### Temporal Z-Score Method (Recommended)
+
+```
+temporal_rfi.py — Two-pass temporal baseline RFI detection
+├── Pass 1: Build per-cell baseline (mean, std) across all scenes
+│   ├── Scene-level median normalization (removes incidence angle effects)
+│   ├── DEM terrain masking (Copernicus 30m, slope >15°)
+│   └── Geographic grid accumulation (0.01° resolution)
+└── Pass 2: Score each scene against baseline
+    ├── Per-pixel z-scores against temporal mean
+    ├── Flag z > 3.0 as RFI candidates
+    └── Extract point coordinates for mapping
+```
+
+### Single-Scene Method (Original)
+
+The original four-method approach (azimuth-line analysis, bright pixel detection, spectral peak analysis, streak detection) is still available in `sentinel1_rfi_demo.py` and `run_jamertest.py`. It works for quick assessment but produces inflated scores in mountainous terrain and is sensitive to orbit geometry.
+
+## Scripts
+
+| Script | Description |
+|--------|-------------|
+| **Core Pipeline** | |
+| `rfi_pipeline.py` | Shared RFI detection module with DEM terrain masking |
+| `temporal_rfi.py` | Temporal z-score RFI detection (Iran/Gulf) |
+| `temporal_rfi_norway.py` | Temporal z-score analysis for Jammertest Norway |
+| **Download & Process** | |
+| `iran_download_process.py` | Download and process S1 scenes over Iran |
+| `gulf_download_process.py` | Download and process S1 scenes over Persian Gulf |
+| `download_iran.py` | Batch download Iran-wide scenes from catalog |
+| `check_tehran.py` | Poll CDSE for new S1 passes over Tehran |
+| **Map Generation** | |
+| `create_iran_map.py` | Interactive Leaflet map for Iran RFI (temporal z-score) |
+| `create_gulf_map.py` | Interactive Leaflet map for Persian Gulf RFI |
+| `create_norway_map.py` | Interactive map for Jammertest with jammer site markers |
+| `create_map.py` | Original Tehran RFI map with SAR overlays |
+| **Analysis** | |
+| `rfi_spatial_norway.py` | Spatial RFI analysis with distance-to-jammer metrics |
+| `run_jamertest.py` | Original single-scene Jammertest analysis |
+| `run_lacourtine.py` | France La Courtine GNSS jamming test analysis |
+| `sentinel1_rfi_demo.py` | Original core pipeline (single-scene method) |
 
 ## Quickstart
 
 ### Prerequisites
 
 - Python 3.9+
-- Free [Copernicus Data Space](https://dataspace.copernicus.eu) account (for downloading Sentinel-1 data)
+- Free [Copernicus Data Space](https://dataspace.copernicus.eu) account
 
 ### Install
 
@@ -174,45 +129,51 @@ cp .env.example .env
 # Edit .env with your CDSE credentials
 ```
 
-Or export directly:
-```bash
-export CDSE_USER="your_email@example.com"
-export CDSE_PASS="your_password"
-```
-
 ### Run
 
 ```bash
-# Demo mode (synthetic data, no downloads needed)
-python sentinel1_rfi_demo.py --demo
+# Temporal z-score analysis (recommended)
+python temporal_rfi.py              # Iran
+python temporal_rfi.py gulf         # Persian Gulf
+python temporal_rfi_norway.py       # Jammertest Norway
 
-# Search for available Sentinel-1 products over Tehran
-python sentinel1_rfi_demo.py --search-only
+# Generate interactive maps
+python create_iran_map.py
+python create_gulf_map.py
+python create_norway_map.py
 
-# Full pipeline: search, download, detect, and plot
-python sentinel1_rfi_demo.py
-
-# Process an already-downloaded .SAFE directory
-python sentinel1_rfi_demo.py --local /path/to/S1A_IW_GRDH_*.SAFE
-
-# Generate interactive map from all downloaded products
-python create_map.py
+# Original single-scene pipeline
+python sentinel1_rfi_demo.py --demo     # Synthetic data demo
+python sentinel1_rfi_demo.py            # Full pipeline (Tehran)
+python run_jamertest.py                 # Norway Jammertest (original method)
 ```
 
-## Scripts
+## Map Output
 
-| Script | Description |
-|--------|-------------|
-| `sentinel1_rfi_demo.py` | Core pipeline — catalog search, download, RFI detection, and diagnostic plots |
-| `create_map.py` | Generate a self-contained interactive Leaflet HTML map from downloaded products |
-| `check_tehran.py` | Poll CDSE catalog for new Sentinel-1 passes over Tehran, auto-download and process |
-| `download_iran.py` | Batch download Iran-wide scenes from a pre-built selection file |
-| `run_jamertest.py` | Memory-efficient RFI analysis of Jamertest Norway exercise scenes |
+The map generators produce self-contained HTML files with:
+- Leaflet.js with satellite/dark basemaps and label overlays
+- Zoom-adaptive grid cells (0.5° at zoom 5 down to 0.001° at zoom 13+)
+- Density-based coloring: top 5% = RED/HIGH, top 15% = ORANGE/MODERATE, rest = GREEN/LOW
+- Per-cell RFI score (0–100) in click popups
+- Time slider for temporal animation across acquisition dates
+- Jammer site markers with range rings (Norway map)
+
+## Key Findings
+
+1. **Terrain masking is essential.** Mountains produce severe false positives in SAR RFI detection due to layover and foreshortening. DEM-based slope masking eliminates 5–22% of pixels per scene depending on topography.
+
+2. **Temporal baselines dramatically reduce false positives.** Single-scene scores of 78–100 drop to 0–1.1 with temporal normalization. The remaining detections are genuine temporal anomalies.
+
+3. **Spatial analysis reveals what scene-level scores hide.** The Jammertest data shows no significant scene-level temporal anomaly, but 10–14x spatial concentration of RFI near the jammer sites — a signal invisible to aggregate scoring.
+
+4. **The L-band to C-band detection question remains open.** The spatial pattern near Jammertest sites is consistent with equipment warm-up emissions from a 50W amplifier, but we cannot definitively rule out co-located RF sources. A coordinated experiment with jamming during an S1 overpass would be conclusive.
 
 ## Data Sources
 
-- **Sentinel-1 GRD products** from the [Copernicus Data Space Ecosystem](https://dataspace.copernicus.eu) (free registration required)
-- **Basemaps**: [CARTO Voyager](https://carto.com/basemaps/) and [Esri World Imagery](https://www.arcgis.com/home/item.html?id=10df2279f9684e4a9f6a7f08febac2a9)
+- **Sentinel-1 GRD** from [Copernicus Data Space Ecosystem](https://dataspace.copernicus.eu)
+- **Copernicus DEM 30m** from [AWS S3](https://copernicus-dem-30m.s3.eu-central-1.amazonaws.com/)
+- **Jammertest schedule** from [NPRA/jammertest-plan](https://github.com/NPRA/jammertest-plan)
+- **Basemaps**: [CARTO Dark](https://carto.com/basemaps/), [Esri World Imagery](https://www.arcgis.com/)
 
 ## References
 
