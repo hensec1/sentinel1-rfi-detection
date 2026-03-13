@@ -1,0 +1,73 @@
+{
+  "name": "Sentinel-1 RFI Detections \u2014 Iran",
+  "method": "temporal_zscore",
+  "z_threshold": 3.0,
+  "grid_res_degrees": 0.05,
+  "dates": {
+    "2026-02-28": {
+      "file": "iran_rfi_2026-02-28.czml",
+      "scenes": 44,
+      "points": 205241
+    },
+    "2026-03-01": {
+      "file": "iran_rfi_2026-03-01.czml",
+      "scenes": 56,
+      "points": 236935
+    },
+    "2026-03-02": {
+      "file": "iran_rfi_2026-03-02.czml",
+      "scenes": 30,
+      "points": 135487
+    },
+    "2026-03-03": {
+      "file": "iran_rfi_2026-03-03.czml",
+      "scenes": 34,
+      "points": 101334
+    },
+    "2026-03-04": {
+      "file": "iran_rfi_2026-03-04.czml",
+      "scenes": 40,
+      "points": 148549
+    },
+    "2026-03-05": {
+      "file": "iran_rfi_2026-03-05.czml",
+      "scenes": 56,
+      "points": 218645
+    },
+    "2026-03-06": {
+      "file": "iran_rfi_2026-03-06.czml",
+      "scenes": 40,
+      "points": 184483
+    },
+    "2026-03-07": {
+      "file": "iran_rfi_2026-03-07.czml",
+      "scenes": 54,
+      "points": 219828
+    },
+    "2026-03-08": {
+      "file": "iran_rfi_2026-03-08.czml",
+      "scenes": 19,
+      "points": 74333
+    },
+    "2026-03-09": {
+      "file": "iran_rfi_2026-03-09.czml",
+      "scenes": 25,
+      "points": 89236
+    },
+    "2026-03-10": {
+      "file": "iran_rfi_2026-03-10.czml",
+      "scenes": 16,
+      "points": 64908
+    },
+    "2026-03-11": {
+      "file": "iran_rfi_2026-03-11.czml",
+      "scenes": 21,
+      "points": 81080
+    },
+    "2026-03-12": {
+      "file": "iran_rfi_2026-03-12.czml",
+      "scenes": 7,
+      "points": 31931
+    }
+  }
+}
