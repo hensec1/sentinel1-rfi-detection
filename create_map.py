@@ -540,14 +540,31 @@ def _build_demo_map(report_data: list) -> None:
     """
     Build a Leaflet map from rfi_report.json without any SAR imagery.
 
-    Emits one GeoJSON marker per report entry, positioned over Tehran,
+    Emits one GeoJSON marker per report entry, positioned over the AOI,
     styled by severity, with a popup showing all detection metrics.
     """
     import json as _json
 
-    tehran_lon_min, tehran_lat_min, tehran_lon_max, tehran_lat_max = _TEHRAN_BOUNDS
-    center_lat = (tehran_lat_min + tehran_lat_max) / 2
-    center_lon = (tehran_lon_min + tehran_lon_max) / 2
+    # Try to read the AOI bbox from the search_results.json written by phase 1
+    search_results_path = OUTPUT_DIR / "search_results.json"
+    bbox = None
+    if search_results_path.exists():
+        try:
+            with open(search_results_path) as f:
+                sr = _json.load(f)
+            q = sr.get("query", {})
+            b = q.get("bbox", {})
+            if all(k in b for k in ("west", "south", "east", "north")):
+                bbox = b
+        except Exception:
+            pass
+
+    if bbox is None:
+        lon_min, lat_min, lon_max, lat_max = _TEHRAN_BOUNDS
+        bbox = {"west": lon_min, "south": lat_min, "east": lon_max, "north": lat_max}
+
+    center_lat = (bbox["south"] + bbox["north"]) / 2
+    center_lon = (bbox["west"] + bbox["east"]) / 2
 
     # Spread markers slightly so they don't all stack
     features = []
