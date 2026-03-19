@@ -1,6 +1,9 @@
 # Credentials
 .env
 
+# Virtual environment
+.venv/
+
 # Output data
 output/downloads/
 output/iran_downloads/

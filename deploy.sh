@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_DIR="/home/sentineluser/apps/sentinel1-rfi-detection"
+APP_DIR="/home/luftlage-sentinel2/apps/sentinel1-rfi-detection"
 BRANCH="production"
 
 echo "==> Starting deploy at $(date)"

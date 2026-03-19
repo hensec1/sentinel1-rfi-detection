@@ -96,7 +96,9 @@ OUTPUT_DIR = Path("output")
 def search_sentinel1_products(start_date: str, end_date: str, bbox: dict) -> list:
     """Query CDSE OData catalog for Sentinel-1 GRD products over the AOI."""
 
-    wkt_point = f"POINT({TEHRAN_CENTER[0]} {TEHRAN_CENTER[1]})"
+    center_lon = (bbox["west"] + bbox["east"]) / 2
+    center_lat = (bbox["south"] + bbox["north"]) / 2
+    wkt_point = f"POINT({center_lon} {center_lat})"
 
     # OData filter for Sentinel-1 GRD products intersecting Tehran
     odata_filter = (
@@ -929,7 +931,24 @@ def main():
         "--output-dir", default="output",
         help="Output directory for results. Default: output/",
     )
+    parser.add_argument(
+        "--bbox", default=None,
+        help=(
+            "Bounding box as 'west,south,east,north' (decimal degrees). "
+            "Default: Tehran (50.8,35.4,51.9,35.9)"
+        ),
+    )
     args = parser.parse_args()
+
+    if args.bbox:
+        try:
+            west, south, east, north = [float(v) for v in args.bbox.split(",")]
+            aoi_bbox = {"west": west, "south": south, "east": east, "north": north}
+        except ValueError:
+            log.error("--bbox must be 'west,south,east,north' (four floats separated by commas)")
+            sys.exit(1)
+    else:
+        aoi_bbox = TEHRAN_BBOX
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -961,7 +980,7 @@ def main():
         return
 
     # --- Mode 2: Search catalog and optionally download ---
-    products = search_sentinel1_products(args.start_date, args.end_date, TEHRAN_BBOX)
+    products = search_sentinel1_products(args.start_date, args.end_date, aoi_bbox)
 
     if not products:
         log.warning("No Sentinel-1 products found for the specified dates and area.")
@@ -970,13 +989,13 @@ def main():
         # Save search results
         with open(output_dir / "search_results.json", "w") as f:
             json.dump({"query": {"start": args.start_date, "end": args.end_date,
-                                  "bbox": TEHRAN_BBOX}, "products": []}, f, indent=2)
+                                  "bbox": aoi_bbox}, "products": []}, f, indent=2)
         return
 
     # Save search results
     with open(output_dir / "search_results.json", "w") as f:
         json.dump({
-            "query": {"start": args.start_date, "end": args.end_date, "bbox": TEHRAN_BBOX},
+            "query": {"start": args.start_date, "end": args.end_date, "bbox": aoi_bbox},
             "products": products,
         }, f, indent=2)
     log.info(f"Search results saved: {output_dir / 'search_results.json'}")
@@ -999,7 +1018,7 @@ def main():
         )
         sys.exit(1)
 
-    log.info("Authenticating with CDSE ...")
+    log.info(f"Authenticating with CDSE as '{username}' ...")
     token = get_cdse_token(username, password)
     log.info("  Authenticated successfully.")
 

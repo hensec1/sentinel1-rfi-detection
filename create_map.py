@@ -529,6 +529,161 @@ def build_html(layers: list, report_data: list) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Demo-mode map builder (no .SAFE data available)
+# ---------------------------------------------------------------------------
+
+# Tehran metropolitan area bounds (lon_min, lat_min, lon_max, lat_max)
+_TEHRAN_BOUNDS = (50.8, 35.4, 51.9, 35.9)
+
+
+def _build_demo_map(report_data: list) -> None:
+    """
+    Build a Leaflet map from rfi_report.json without any SAR imagery.
+
+    Emits one GeoJSON marker per report entry, positioned over the AOI,
+    styled by severity, with a popup showing all detection metrics.
+    """
+    import json as _json
+
+    # Try to read the AOI bbox from the search_results.json written by phase 1
+    search_results_path = OUTPUT_DIR / "search_results.json"
+    bbox = None
+    if search_results_path.exists():
+        try:
+            with open(search_results_path) as f:
+                sr = _json.load(f)
+            q = sr.get("query", {})
+            b = q.get("bbox", {})
+            if all(k in b for k in ("west", "south", "east", "north")):
+                bbox = b
+        except Exception:
+            pass
+
+    if bbox is None:
+        lon_min, lat_min, lon_max, lat_max = _TEHRAN_BOUNDS
+        bbox = {"west": lon_min, "south": lat_min, "east": lon_max, "north": lat_max}
+
+    center_lat = (bbox["south"] + bbox["north"]) / 2
+    center_lon = (bbox["west"] + bbox["east"]) / 2
+
+    # Spread markers slightly so they don't all stack
+    features = []
+    for i, entry in enumerate(report_data):
+        severity = entry.get("severity", "UNKNOWN")
+        color = (
+            "#ff0000" if severity == "HIGH"
+            else "#ff8c00" if severity == "MODERATE"
+            else "#ffd700" if severity == "LOW"
+            else "#888888"
+        )
+        # Small lat offset per entry so markers are readable
+        lat = center_lat + (i - len(report_data) / 2) * 0.015
+        lon = center_lon
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [lon, lat]},
+            "properties": {
+                "product": entry.get("product_name", ""),
+                "polarization": entry.get("polarization", ""),
+                "date": entry.get("date", ""),
+                "rfi_score": entry.get("score", 0),
+                "severity": severity,
+                "n_rfi_lines": entry.get("n_rfi_lines", 0),
+                "pct_rfi_lines": entry.get("pct_rfi_lines", 0),
+                "n_bright_pixels": entry.get("n_bright_pixels", 0),
+                "spectral_peaks": entry.get("spectral_peaks", 0),
+                "n_streaks": entry.get("n_streaks", 0),
+                "color": color,
+            },
+        })
+
+    geojson_str = _json.dumps({"type": "FeatureCollection", "features": features})
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Sentinel-1 RFI / GPS Jamming Detection (Demo)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    body {{ margin: 0; padding: 0; }}
+    #map {{ width: 100%; height: 100vh; }}
+    .legend {{
+      background: white; padding: 10px 14px; border-radius: 5px;
+      box-shadow: 0 0 15px rgba(0,0,0,0.2); font: 13px/1.5 Arial, sans-serif;
+    }}
+    .legend h4 {{ margin: 0 0 8px 0; font-size: 14px; }}
+    .legend-item {{ display: flex; align-items: center; margin-bottom: 4px; }}
+    .legend-color {{ width: 20px; height: 14px; margin-right: 8px; border: 1px solid #666; flex-shrink: 0; }}
+    .demo-banner {{
+      position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+      background: rgba(0,0,0,0.7); color: #fff; padding: 6px 16px;
+      border-radius: 4px; font: bold 13px Arial, sans-serif; z-index: 1000;
+    }}
+  </style>
+</head>
+<body>
+  <div class="demo-banner">Demo mode — synthetic data, no SAR imagery overlay</div>
+  <div id="map"></div>
+  <script>
+  var map = L.map('map').setView([{center_lat:.4f}, {center_lon:.4f}], 10);
+
+  L.tileLayer('https://{{s}}.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+    attribution: '&copy; <a href="https://carto.com/">CARTO</a> &copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>',
+    maxZoom: 19, subdomains: 'abcd'
+  }}).addTo(map);
+
+  var geojsonData = {geojson_str};
+
+  L.geoJSON(geojsonData, {{
+    pointToLayer: function(feature, latlng) {{
+      return L.circleMarker(latlng, {{
+        radius: 14,
+        fillColor: feature.properties.color,
+        color: '#333', weight: 1.5,
+        opacity: 1, fillOpacity: 0.75
+      }});
+    }},
+    onEachFeature: function(feature, layer) {{
+      var p = feature.properties;
+      layer.bindPopup(
+        '<b>RFI Detection (Demo)</b><br>'
+        + 'Product: ' + p.product + '<br>'
+        + 'Date: ' + p.date + '<br>'
+        + 'Polarization: ' + p.polarization + '<br>'
+        + 'RFI Score: <b>' + p.rfi_score.toFixed(1) + ' / 100</b><br>'
+        + 'Severity: <b>' + p.severity + '</b><br>'
+        + 'Anomalous lines: ' + p.n_rfi_lines + ' (' + p.pct_rfi_lines.toFixed(1) + '%)<br>'
+        + 'Bright pixels: ' + p.n_bright_pixels + '<br>'
+        + 'Spectral peaks: ' + p.spectral_peaks + '<br>'
+        + 'Linear streaks: ' + p.n_streaks
+      );
+    }}
+  }}).addTo(map);
+
+  var legend = L.control({{position: 'bottomright'}});
+  legend.onAdd = function(map) {{
+    var div = L.DomUtil.create('div', 'legend');
+    div.innerHTML = '<h4>RFI Severity</h4>'
+      + '<div class="legend-item"><div class="legend-color" style="background:#ff0000;opacity:0.7;"></div>HIGH (&gt;60)</div>'
+      + '<div class="legend-item"><div class="legend-color" style="background:#ff8c00;opacity:0.7;"></div>MODERATE (30-60)</div>'
+      + '<div class="legend-item"><div class="legend-color" style="background:#ffd700;opacity:0.7;"></div>LOW (10-30)</div>';
+    return div;
+  }};
+  legend.addTo(map);
+  </script>
+</body>
+</html>"""
+
+    out_path = OUTPUT_DIR / "rfi_map.html"
+    out_path.write_text(html, encoding="utf-8")
+    size_kb = out_path.stat().st_size / 1024
+    log.info(f"Demo map written: {out_path} ({size_kb:.0f} KB)")
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -589,7 +744,11 @@ def main():
     products = find_products()
     log.info(f"Found {len(products)} product/polarization combinations")
     if not products:
-        log.error("No .SAFE products found in output/downloads/")
+        if report_data:
+            log.info("No .SAFE products found — generating demo map from rfi_report.json")
+            _build_demo_map(report_data)
+            return
+        log.error("No .SAFE products found in output/downloads/ and no rfi_report.json")
         sys.exit(1)
 
     # Cache parsed grids per SAFE dir (VV and VH share the same grid)
