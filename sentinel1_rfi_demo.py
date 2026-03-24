@@ -35,6 +35,7 @@ Register for free CDSE credentials at: https://dataspace.copernicus.eu
 """
 
 import argparse
+import gc
 import json
 import logging
 import os
@@ -233,10 +234,15 @@ def find_measurement_tifs(safe_dir: Path) -> list:
 
 
 def load_sar_image(tif_path: Path) -> tuple:
-    """Load a Sentinel-1 GRD measurement GeoTIFF. Returns (data, profile)."""
+    """Load a Sentinel-1 GRD measurement GeoTIFF. Returns (data, profile).
+
+    Reads at native resolution but uses float32 to halve memory vs float64.
+    The original data is uint16 (~3.4 GB for a full scene at float32 vs ~6.8 GB
+    at float64), with no meaningful precision loss for dB-scale SAR analysis.
+    """
     log.info(f"  Loading {tif_path.name} ...")
     with rasterio.open(tif_path) as src:
-        data = src.read(1).astype(np.float64)
+        data = src.read(1).astype(np.float32)
         profile = dict(src.profile)
         bounds = src.bounds
         transform = src.transform
@@ -250,10 +256,18 @@ def load_sar_image(tif_path: Path) -> tuple:
 # ---------------------------------------------------------------------------
 
 def intensity_to_db(data: np.ndarray) -> np.ndarray:
-    """Convert linear intensity to dB, handling zeros."""
+    """Convert linear intensity to dB, handling zeros.
+
+    Avoids the extra full-array copy that np.where() produces by zeroing out
+    non-positive values in-place on a copy, then using np.log10 directly.
+    Keeps float32 to halve memory vs float64.
+    """
+    out = data.astype(np.float32, copy=True)
+    out[out <= 0] = np.nan
     with np.errstate(divide="ignore", invalid="ignore"):
-        db = 10.0 * np.log10(np.where(data > 0, data, np.nan))
-    return db
+        np.log10(out, out=out)
+        out *= np.float32(10.0)
+    return out
 
 
 def detect_rfi_azimuth_lines(data_db: np.ndarray) -> dict:
@@ -264,7 +278,7 @@ def detect_rfi_azimuth_lines(data_db: np.ndarray) -> dict:
     the mean backscatter of affected azimuth positions.
     """
     row_means = np.nanmean(data_db, axis=1)
-    row_stds = np.nanstd(data_db, axis=1)
+    # row_stds removed: was never used by callers and nanstd scans the whole image
 
     # Robust statistics using median/MAD to avoid RFI biasing the baseline
     global_median = np.nanmedian(row_means)
@@ -285,7 +299,6 @@ def detect_rfi_azimuth_lines(data_db: np.ndarray) -> dict:
 
     return {
         "row_means": row_means,
-        "row_stds": row_stds,
         "zscores": zscores,
         "rfi_line_mask": rfi_mask,
         "global_median": global_median,
@@ -301,46 +314,48 @@ def detect_rfi_bright_pixels(data_db: np.ndarray) -> dict:
 
     RFI from jammers creates pixels far brighter than the natural
     backscatter distribution.
+
+    Memory strategy: the baseline is computed and kept at a reduced resolution
+    (scale x scale sub-sampling) so we never allocate a second full-size float
+    array.  The residual is computed at the same reduced scale for display, then
+    freed.  Only the full-resolution boolean bright_mask (1/8 the size of a
+    float32 array) is retained.
     """
-    from scipy.ndimage import zoom as scipy_zoom
     h, w = data_db.shape
 
-    # For large images, use a bigger downscale factor
+    # Downscale factor for baseline estimation (same logic as before)
     scale = max(8, min(h, w) // 256)
 
-    # Replace NaN with local fill for the median filter (NaN poisons median_filter)
+    # Build a small copy for median-filter baseline — NaN-fill first
     small = data_db[::scale, ::scale].copy()
     nan_mask_small = ~np.isfinite(small)
-    if np.any(~nan_mask_small):
-        fill_val = np.nanmedian(small)
-    else:
-        fill_val = 0.0
+    fill_val = float(np.nanmedian(small)) if np.any(np.isfinite(small)) else 0.0
     small[nan_mask_small] = fill_val
 
     baseline_small = ndimage.median_filter(small, size=15)
+    del small; gc.collect()
 
-    # Upsample back
-    baseline = scipy_zoom(baseline_small, (h / baseline_small.shape[0], w / baseline_small.shape[1]))
-    baseline = baseline[:h, :w]
+    # Compute residual at the *small* scale for stats and display — avoids
+    # upsampling baseline back to full resolution (which would cost a full float array).
+    data_small = data_db[::scale, ::scale].copy()
+    residual_small = data_small - baseline_small
+    del data_small, baseline_small; gc.collect()
 
-    # Restore NaN in baseline where original data was NaN
-    nan_mask = ~np.isfinite(data_db)
-    baseline[nan_mask] = np.nan
-
-    residual = data_db - baseline
-
-    # Robust stats on valid residual pixels only
-    valid_residual = residual[np.isfinite(residual)]
+    # Robust stats on valid residual pixels only (computed at reduced scale)
+    valid_residual = residual_small[np.isfinite(residual_small)]
     if len(valid_residual) > 0:
-        med = np.median(valid_residual)
-        mad = np.median(np.abs(valid_residual - med))
+        med = float(np.median(valid_residual))
+        mad = float(np.median(np.abs(valid_residual - med)))
         rstd = 1.4826 * mad
         if rstd < 0.01:
-            rstd = np.std(valid_residual)
-        bright_mask = np.isfinite(residual) & (residual > (med + RFI_PIXEL_ZSCORE * rstd))
+            rstd = float(np.std(valid_residual))
     else:
         med, rstd = 0.0, 1.0
-        bright_mask = np.zeros_like(data_db, dtype=bool)
+
+    # Bright-pixel threshold applied at full resolution on data_db directly
+    # (no copy needed — boolean output is 1 bit per pixel effectively)
+    threshold = med + RFI_PIXEL_ZSCORE * rstd
+    bright_mask = np.isfinite(data_db) & (data_db > threshold)
 
     n_bright = int(np.sum(bright_mask))
     n_valid = int(np.sum(np.isfinite(data_db)))
@@ -348,9 +363,10 @@ def detect_rfi_bright_pixels(data_db: np.ndarray) -> dict:
 
     log.info(f"    Bright-pixel analysis: {n_bright} pixels flagged ({pct:.2f}%)")
 
+    # Keep only the small residual for display; caller must not expect full-res arrays
     return {
-        "baseline": baseline,
-        "residual": residual,
+        "residual_small": residual_small,   # shape (h//scale, w//scale) — for plot panel 4
+        "display_scale": scale,
         "bright_mask": bright_mask,
         "n_bright_pixels": n_bright,
         "pct_bright": pct,
@@ -463,7 +479,12 @@ def detect_rfi_streaks(bright_mask: np.ndarray) -> dict:
 
 
 def run_rfi_detection(data: np.ndarray) -> dict:
-    """Run the full RFI detection pipeline on a SAR intensity image."""
+    """Run the full RFI detection pipeline on a SAR intensity image.
+
+    Memory strategy: data_db is computed once and freed as soon as the last
+    detector is done with it.  A downsampled copy for display is captured
+    before deletion and stored in the result under 'data_db_small'.
+    """
     log.info("  Running RFI detection pipeline ...")
     data_db = intensity_to_db(data)
 
@@ -471,6 +492,19 @@ def run_rfi_detection(data: np.ndarray) -> dict:
     bright = detect_rfi_bright_pixels(data_db)
     spectral = detect_rfi_spectral(data_db)
     streaks = detect_rfi_streaks(bright["bright_mask"])
+
+    # Capture a small display copy before freeing the full-res dB array.
+    # Use the same display scale that detect_rfi_bright_pixels used so all
+    # panels are consistently sized.
+    ds = bright["display_scale"]
+    data_db_small = data_db[::ds, ::ds].copy()
+    del data_db; gc.collect()
+
+    # Also pre-downscale bright_mask for the plot and drop the full-res bool array.
+    # A full-scene bool mask is ~160 MB for a 25kx25k image — free it early.
+    bright_mask_small = bright["bright_mask"][::ds, ::ds].copy()
+    del bright["bright_mask"]; gc.collect()
+    bright["bright_mask"] = bright_mask_small   # replace with small version
 
     # Composite RFI severity score (0-100)
     score = min(100.0, (
@@ -492,7 +526,7 @@ def run_rfi_detection(data: np.ndarray) -> dict:
     log.info(f"  RFI severity score: {score:.1f}/100 ({severity})")
 
     return {
-        "data_db": data_db,
+        "data_db_small": data_db_small,   # downsampled; full-res has been freed
         "azimuth": azimuth,
         "bright": bright,
         "spectral": spectral,
@@ -658,10 +692,11 @@ def run_demo_mode(output_dir: Path):
         log.info(f"  Generated {data.shape[0]}x{data.shape[1]} synthetic SAR image")
 
         rfi = run_rfi_detection(data)
+        del data; gc.collect()
 
         fig_name = f"rfi_{sc['name']}_{sc['pol']}.png"
         fig_path = output_dir / fig_name
-        plot_rfi_report(rfi["data_db"], rfi, sc["name"], sc["pol"], fig_path)
+        plot_rfi_report(rfi, sc["name"], sc["pol"], fig_path)
 
         all_results.append({
             "product_name": sc["name"],
@@ -677,6 +712,7 @@ def run_demo_mode(output_dir: Path):
             "n_streaks": rfi["streaks"]["n_streaks"],
             "figure_path": str(fig_path),
         })
+        del rfi; gc.collect()
 
     print_summary(all_results)
 
@@ -692,9 +728,29 @@ def run_demo_mode(output_dir: Path):
 # 6. Visualization
 # ---------------------------------------------------------------------------
 
-def plot_rfi_report(data_db: np.ndarray, results: dict, product_name: str,
+def plot_rfi_report(results: dict, product_name: str,
                     polarization: str, output_path: Path):
-    """Generate a multi-panel RFI detection report figure."""
+    """Generate a multi-panel RFI detection report figure.
+
+    All display arrays are pre-downsampled in run_rfi_detection /
+    detect_rfi_bright_pixels so this function never touches a full-res array.
+    """
+    az = results["azimuth"]
+    br = results["bright"]
+    st = results["streaks"]
+    ds = br["display_scale"]
+
+    # Pre-downsampled arrays stored in the results dict (already small — no further slicing)
+    data_db_small = results["data_db_small"]   # shape (h//ds, w//ds)
+    residual_small = br["residual_small"]       # same shape
+    bright_mask_small = br["bright_mask"]       # already downsampled in run_rfi_detection
+
+    finite_vals = data_db_small[np.isfinite(data_db_small)]
+    if len(finite_vals) > 0:
+        vmin, vmax = np.percentile(finite_vals, [2, 98])
+    else:
+        vmin, vmax = -30, 0
+
     fig, axes = plt.subplots(2, 3, figsize=(20, 13))
     fig.suptitle(
         f"Sentinel-1 RFI Detection — Tehran, Iran\n"
@@ -703,20 +759,9 @@ def plot_rfi_report(data_db: np.ndarray, results: dict, product_name: str,
         fontsize=13, fontweight="bold", y=0.98,
     )
 
-    az = results["azimuth"]
-    br = results["bright"]
-    st = results["streaks"]
-
     # Panel 1: SAR image in dB
     ax = axes[0, 0]
-    finite_vals = data_db[np.isfinite(data_db)]
-    if len(finite_vals) > 0:
-        vmin, vmax = np.percentile(finite_vals, [2, 98])
-    else:
-        vmin, vmax = -30, 0
-    # Downsample for display if image is large
-    ds = max(1, max(data_db.shape) // 4096)
-    ax.imshow(data_db[::ds, ::ds], cmap="gray", vmin=vmin, vmax=vmax, aspect="auto")
+    ax.imshow(data_db_small, cmap="gray", vmin=vmin, vmax=vmax, aspect="auto")
     ax.set_title("SAR Backscatter (dB)")
     ax.set_xlabel("Range (pixels)")
     ax.set_ylabel("Azimuth (pixels)")
@@ -744,25 +789,18 @@ def plot_rfi_report(data_db: np.ndarray, results: dict, product_name: str,
 
     # Panel 3: Bright pixel mask (RFI map)
     ax = axes[0, 2]
-    # For very large images, downsample the overlay for memory
-    ds = max(1, max(data_db.shape) // 4096)
-    db_small = data_db[::ds, ::ds]
-    mask_small = br["bright_mask"][::ds, ::ds]
-    rfi_overlay = np.zeros((*db_small.shape, 4))
-    rfi_overlay[mask_small, :] = [1, 0, 0, 0.8]  # red
-    ax.imshow(db_small, cmap="gray", vmin=vmin, vmax=vmax, aspect="auto")
+    rfi_overlay = np.zeros((*bright_mask_small.shape, 4), dtype=np.float32)
+    rfi_overlay[bright_mask_small, :] = [1, 0, 0, 0.8]  # red
+    ax.imshow(data_db_small, cmap="gray", vmin=vmin, vmax=vmax, aspect="auto")
     ax.imshow(rfi_overlay, aspect="auto")
+    del rfi_overlay; gc.collect()
     ax.set_title(f"RFI Bright Pixels (red)\n{br['n_bright_pixels']} pixels flagged")
     ax.set_xlabel("Range (pixels)")
     ax.set_ylabel("Azimuth (pixels)")
 
     # Panel 4: Residual (data - baseline) showing RFI anomalies
     ax = axes[1, 0]
-    residual = br["residual"]
-    valid_res = residual[np.isfinite(residual)]
-    if len(valid_res) > 0:
-        pass  # use fixed range below
-    im = ax.imshow(residual[::ds, ::ds], cmap="RdBu_r", vmin=-10, vmax=10, aspect="auto")
+    im = ax.imshow(residual_small, cmap="RdBu_r", vmin=-10, vmax=10, aspect="auto")
     plt.colorbar(im, ax=ax, label="Residual (dB)")
     ax.set_title("Backscatter Residual\n(Data − Local Median Baseline)")
     ax.set_xlabel("Range (pixels)")
@@ -784,7 +822,7 @@ def plot_rfi_report(data_db: np.ndarray, results: dict, product_name: str,
 
     # Panel 6: Detected streaks overlaid on image
     ax = axes[1, 2]
-    ax.imshow(data_db[::ds, ::ds], cmap="gray", vmin=vmin, vmax=vmax, aspect="auto")
+    ax.imshow(data_db_small, cmap="gray", vmin=vmin, vmax=vmax, aspect="auto")
     for s in st["streaks"]:
         rect = plt.Rectangle(
             (s["col_start"] / ds, (s["row_center"] - s["height"] / 2) / ds),
@@ -799,6 +837,7 @@ def plot_rfi_report(data_db: np.ndarray, results: dict, product_name: str,
     plt.tight_layout(rect=[0, 0, 1, 0.93])
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+    gc.collect()
     log.info(f"  Report saved: {output_path}")
 
 
@@ -871,6 +910,7 @@ def process_safe_directory(safe_dir: Path, output_dir: Path) -> list:
 
         data, profile, bounds, transform = load_sar_image(tif_path)
         rfi = run_rfi_detection(data)
+        del data; gc.collect()  # free the ~3 GB float32 before plotting
 
         # Extract date from product name
         # Typical: S1A_IW_GRDH_1SDV_20260228T025311_...
@@ -883,7 +923,7 @@ def process_safe_directory(safe_dir: Path, output_dir: Path) -> list:
 
         fig_name = f"rfi_{product_name}_{pol}.png"
         fig_path = output_dir / fig_name
-        plot_rfi_report(rfi["data_db"], rfi, product_name, pol, fig_path)
+        plot_rfi_report(rfi, product_name, pol, fig_path)
 
         results.append({
             "product_name": product_name,
@@ -899,6 +939,7 @@ def process_safe_directory(safe_dir: Path, output_dir: Path) -> list:
             "n_streaks": rfi["streaks"]["n_streaks"],
             "figure_path": str(fig_path),
         })
+        del rfi; gc.collect()  # free display arrays before next polarization
 
     return results
 
