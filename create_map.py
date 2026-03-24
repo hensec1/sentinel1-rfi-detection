@@ -748,8 +748,12 @@ def main():
             log.info("No .SAFE products found — generating demo map from rfi_report.json")
             _build_demo_map(report_data)
             return
-        log.error("No .SAFE products found in output/downloads/ and no rfi_report.json")
-        sys.exit(1)
+        map_path = OUTPUT_DIR / "rfi_map.html"
+        if map_path.exists():
+            log.info("No new data — existing map left in place")
+        else:
+            log.warning("No .SAFE products and no rfi_report.json — nothing to map")
+        return
 
     # Cache parsed grids per SAFE dir (VV and VH share the same grid)
     grid_cache = {}
